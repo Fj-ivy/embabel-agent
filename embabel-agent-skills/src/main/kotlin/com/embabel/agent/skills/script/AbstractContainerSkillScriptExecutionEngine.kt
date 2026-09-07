@@ -20,6 +20,7 @@ import org.slf4j.LoggerFactory
 import java.nio.file.Files
 import java.nio.file.Path
 import java.util.concurrent.TimeUnit
+import java.util.UUID
 import kotlin.io.path.absolutePathString
 import kotlin.io.path.exists
 import kotlin.time.Duration
@@ -90,6 +91,9 @@ abstract class AbstractContainerSkillScriptExecutionEngine(
      */
     protected open val useWorkdir: Boolean = true
 
+    protected open fun forceRemoveCommand(containerInstanceName: String): List<String> =
+        listOf(containerCommand, "rm", "-f", containerInstanceName)
+
     // --- SkillScriptExecutionEngine ---
 
     override fun supportedLanguages(): Set<ScriptLanguage> = supportedLanguages
@@ -135,6 +139,8 @@ abstract class AbstractContainerSkillScriptExecutionEngine(
         val scriptDir = tempBase.resolve("script").also { Files.createDirectories(it) }
         val inputDir = tempBase.resolve("input").also { Files.createDirectories(it) }
         val outputDir = tempBase.resolve("output").also { Files.createDirectories(it) }
+        val containerInstanceName = "embabel-$tempDirPrefix-${UUID.randomUUID()}"
+        var containerMayBeRunning = false
 
         try {
             // Stage the script file into its own mount directory
@@ -148,32 +154,41 @@ abstract class AbstractContainerSkillScriptExecutionEngine(
 
             val interpreter = interpreterFor(script.language)
             val command = interpreter + listOf("/script/${script.fileName}") + args
-            val containerCmd = buildContainerCommand(command, scriptDir, inputDir, outputDir)
+            val containerCmd = buildContainerCommand(command, scriptDir, inputDir, outputDir, containerInstanceName)
 
             logger.debug("Executing {} command: {}", containerCommand, containerCmd.joinToString(" "))
 
-            return runContainerProcess(containerCmd, stdin, outputDir, script.fileName)
+            containerMayBeRunning = true
+            val result = runContainerProcess(containerCmd, stdin, outputDir, script.fileName)
+            containerMayBeRunning = result is ScriptExecutionResult.Failure && result.timedOut
+            return result
         } finally {
-            try {
-                tempBase.toFile().deleteRecursively()
-            } catch (e: Exception) {
-                logger.warn("Failed to cleanup temp directory: ${tempBase}, error:${e.message}")
+            val safeToDeleteTempDirectory = !containerMayBeRunning || forceRemoveContainer(containerInstanceName)
+            if (safeToDeleteTempDirectory) {
+                try {
+                    tempBase.toFile().deleteRecursively()
+                } catch (e: Exception) {
+                    logger.warn("Failed to cleanup temp directory: ${tempBase}, error:${e.message}")
+                }
+            } else {
+                logger.error("Preserving temp directory {} because container {} may still be running", tempBase, containerInstanceName)
             }
         }
     }
 
     // --- Container command construction ---
 
-    private fun buildContainerCommand(
+    internal fun buildContainerCommand(
         command: List<String>,
         scriptDir: Path,
         inputDir: Path,
         outputDir: Path,
+        containerInstanceName: String,
     ): List<String> {
         return buildList {
             // -i keeps the container's stdin open so a provided stdin is actually
             // delivered; without it the runtime attaches stdin to /dev/null and drops it.
-            add(containerCommand); add("run"); add("--rm"); add("-i")
+            add(containerCommand); add("run"); add("--rm"); add("--name"); add(containerInstanceName); add("-i")
 
             memoryLimit?.let { addAll(listOf("--memory", it.render())) }
             cpuLimit?.let { addAll(listOf("--cpus", it.render())) }
@@ -213,12 +228,45 @@ abstract class AbstractContainerSkillScriptExecutionEngine(
                     listOf(
                         "/bin/sh",
                         "-c",
-                        $$"mkdir -p \"$$workDir\" && cd \"$$workDir\" && exec \"$@\"", "--"
+                        "mkdir -p \"\$1\" && cd \"\$1\" && shift && exec \"\$@\"",
+                        "--",
+                        workDir,
                     )
                 )
             }
             addAll(command)
         }
+    }
+
+    private fun forceRemoveContainer(containerInstanceName: String): Boolean = try {
+        val process = ProcessBuilder(forceRemoveCommand(containerInstanceName))
+            .redirectErrorStream(true)
+            .start()
+        if (!process.waitFor(10, TimeUnit.SECONDS)) {
+            process.destroyForcibly()
+            process.waitFor()
+            logger.error("Timed out removing $containerName container $containerInstanceName")
+            false
+        } else if (process.exitValue() != 0) {
+            val output = process.inputStream.bufferedReader().readText().trim()
+            logger.error(
+                "Failed to remove {} container {}: exit {}, output {}",
+                containerName,
+                containerInstanceName,
+                process.exitValue(),
+                output,
+            )
+            false
+        } else {
+            true
+        }
+    } catch (e: InterruptedException) {
+        Thread.currentThread().interrupt()
+        logger.error("Interrupted while removing $containerName container $containerInstanceName")
+        false
+    } catch (e: Exception) {
+        logger.error("Failed to remove $containerName container $containerInstanceName: ${e.message}")
+        false
     }
 
     // --- Process execution ---

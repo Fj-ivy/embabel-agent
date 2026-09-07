@@ -26,12 +26,13 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.time.Duration
 import kotlin.time.Duration.Companion.seconds
+import kotlin.time.measureTimedValue
 
 /**
  * Tests for PodmanSkillScriptExecutionEngine.
  *
  * These tests require Podman to be installed and functional.
- * They use the standard ubuntu:22.04 image which should be widely available.
+ * They use the standard ubuntu:26.04 image which should be widely available.
  */
 @DisabledOnOs(OS.WINDOWS)
 @EnabledIf("shouldRunPodmanTests", disabledReason = "Podman tests run when Podman is available")
@@ -181,6 +182,24 @@ class PodmanSkillScriptExecutionEngineTest {
 
     @Test
     @EnabledIf("isPodmanAvailable")
+    fun `execute treats workDir as a literal path`() {
+        val workDir = "/tmp/work-\$(printf injected)-\$PROJECT-a\"b"
+        val engine = PodmanSkillScriptExecutionEngine(
+            image = TEST_IMAGE,
+            user = null,
+            workDir = workDir,
+        )
+        val script = createScript("test.sh", ScriptLanguage.BASH, "#!/bin/bash\npwd")
+
+        val result = engine.execute(script)
+
+        assertTrue(result is ScriptExecutionResult.Success, "Expected Success but got: $result")
+        val success = result as ScriptExecutionResult.Success
+        assertEquals(workDir, success.stdout.trim())
+    }
+
+    @Test
+    @EnabledIf("isPodmanAvailable")
     fun `execute times out long-running script`() {
         val engine = PodmanSkillScriptExecutionEngine(
             image = TEST_IMAGE,
@@ -189,12 +208,13 @@ class PodmanSkillScriptExecutionEngineTest {
         )
         val script = createScript("test.sh", ScriptLanguage.BASH, "#!/bin/bash\nsleep 30")
 
-        val result = engine.execute(script)
+        val (result, elapsed) = measureTimedValue { engine.execute(script) }
 
         assertTrue(result is ScriptExecutionResult.Failure)
         val failure = result as ScriptExecutionResult.Failure
         assertTrue(failure.timedOut)
         assertTrue(failure.error.contains("timed out"))
+        assertTrue(elapsed < 8.seconds, "Timeout cleanup took $elapsed")
     }
 
     @Test

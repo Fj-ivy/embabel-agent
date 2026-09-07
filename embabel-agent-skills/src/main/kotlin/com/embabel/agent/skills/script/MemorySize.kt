@@ -69,6 +69,7 @@ data class MemorySize(
         fun gigabytes(gigabytes: Long): MemorySize = MemorySize(gigabytes, MemoryUnit.GIGABYTES)
 
         /** [terabytes] terabytes. eg: 1 -> 1t*/
+        @JvmStatic
         fun terabytes(terabytes: Long): MemorySize = MemorySize(terabytes, MemoryUnit.TERABYTES)
     }
 }

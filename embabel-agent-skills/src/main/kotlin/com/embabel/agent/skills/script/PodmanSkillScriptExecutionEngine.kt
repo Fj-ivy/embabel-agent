@@ -91,7 +91,12 @@ class PodmanSkillScriptExecutionEngine @JvmOverloads constructor(
     // when this flag is false, matching Docker's implicit behavior.
     override val useWorkdir = false
 
+    override fun forceRemoveCommand(containerInstanceName: String): List<String> =
+        listOf(containerCommand, "rm", "-f", "--ignore", "--time", "0", containerInstanceName)
+
     companion object {
+        const val DEFAULT_IMAGE = AbstractContainerSkillScriptExecutionEngine.DEFAULT_IMAGE
+
         /**
          * Create an engine confined to [root]: input files are resolved against [root]
          * and anything outside it (absolute paths, `..` traversal) is rejected.

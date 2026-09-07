@@ -77,6 +77,7 @@ class DockerSkillScriptExecutionEngine @JvmOverloads constructor(
     override val useWorkdir = true
 
     companion object {
+        const val DEFAULT_IMAGE = AbstractContainerSkillScriptExecutionEngine.DEFAULT_IMAGE
 
         /**
          * Create an engine confined to [root]: input files are resolved against [root]

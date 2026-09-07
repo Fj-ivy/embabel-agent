@@ -21,13 +21,13 @@ import kotlin.math.roundToInt
  * A type-safe CPU limit for a container's `--cpus` flag, stored internally as integer
  * **millicores** (1 core = 1000 millicores).
  *
- * @param millicores the limit in thousandths of a CPU core; must be positive
+ * @param millicores the limit in thousandths of a CPU core; must be at least 10
  */
 data class CpuLimit(
     val millicores: Int,
 ) {
     init {
-        require(millicores > 0) { "CPU limit must be positive, was $millicores millicores" }
+        require(millicores >= 10) { "CPU limit must be at least 10 millicores, was $millicores millicores" }
     }
 
     /**

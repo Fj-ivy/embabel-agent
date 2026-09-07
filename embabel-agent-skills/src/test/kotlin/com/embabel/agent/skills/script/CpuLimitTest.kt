@@ -26,20 +26,26 @@ class CpuLimitTest {
     inner class Construction {
 
         @Test
-        fun `positive millicores are accepted`() {
-            assertEquals(1000, CpuLimit(1000).millicores)
+        fun `minimum millicores are accepted`() {
+            assertEquals(10, CpuLimit(10).millicores)
+        }
+
+        @Test
+        fun `millicores below minimum are rejected`() {
+            val ex = assertThrows(IllegalArgumentException::class.java) { CpuLimit(9) }
+            assertEquals("CPU limit must be at least 10 millicores, was 9 millicores", ex.message)
         }
 
         @Test
         fun `zero millicores are rejected`() {
             val ex = assertThrows(IllegalArgumentException::class.java) { CpuLimit(0) }
-            assertEquals("CPU limit must be positive, was 0 millicores", ex.message)
+            assertEquals("CPU limit must be at least 10 millicores, was 0 millicores", ex.message)
         }
 
         @Test
         fun `negative millicores are rejected`() {
             val ex = assertThrows(IllegalArgumentException::class.java) { CpuLimit(-1) }
-            assertEquals("CPU limit must be positive, was -1 millicores", ex.message)
+            assertEquals("CPU limit must be at least 10 millicores, was -1 millicores", ex.message)
         }
     }
 
@@ -74,11 +80,6 @@ class CpuLimitTest {
         @Test
         fun `ten millicores keeps leading zero and trims trailing`() {
             assertEquals("0.01", CpuLimit(10).render())
-        }
-
-        @Test
-        fun `one millicore keeps all leading zeros`() {
-            assertEquals("0.001", CpuLimit(1).render())
         }
 
         @Test
