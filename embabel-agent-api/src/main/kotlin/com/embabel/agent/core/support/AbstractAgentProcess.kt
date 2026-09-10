@@ -248,6 +248,16 @@ abstract class AbstractAgentProcess(
     override val history: List<ActionInvocation>
         get() = _history.toList()
 
+    @InternalAgentStateApi
+    internal fun replaceRuntimeState(
+        status: AgentProcessStatusCode,
+        history: List<ActionInvocation>,
+    ) {
+        _status.set(status)
+        _history.clear()
+        _history.addAll(history)
+    }
+
     override val toolsStats: ToolsStats
         get() = agenticEventListenerToolsStats
 
@@ -341,7 +351,7 @@ abstract class AbstractAgentProcess(
      */
     private fun executeTurn(): AgentProcess {
         if (agent.goals.isEmpty() && processOptions.plannerType.needsGoals) {
-            logger.info("🛑 Process {} has no goals: {}", this.id, agent.goals)
+            logger.error("🛑 Process {} has no goals", this.id)
             error("Agent ${agent.name} has no goals: ${agent.infoString(verbose = true)}")
         }
 

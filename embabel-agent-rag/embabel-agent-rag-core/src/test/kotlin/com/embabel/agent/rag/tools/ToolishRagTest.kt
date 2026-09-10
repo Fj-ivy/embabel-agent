@@ -464,10 +464,35 @@ class ToolishRagTest {
     }
 
     @Nested
-    inner class SearchWithFilterExtensionsTests {
+    inner class FilterDispatchExtensionsTests {
 
         @Test
-        fun `filter helpers should be callable on CoreSearchOperations`() {
+        fun `entities-only selection inflates topK before filtering mixed vector results`() {
+            val vectorSearch = mockk<VectorSearch>()
+            val request = TextSimilaritySearchRequest("test query", 0.5, 1)
+            every {
+                vectorSearch.vectorSearch(
+                    match<TextSimilaritySearchRequest> { it.topK == 3 },
+                    Retrievable::class.java,
+                )
+            } returns listOf(
+                SimpleSimilaritySearchResult(match = createChunk("chunk", "content"), score = 0.9),
+                SimpleSimilaritySearchResult(match = createEntity("person", "Alice"), score = 0.8),
+            )
+
+            val results = vectorSearch.vectorSearchWithFilterDispatch(
+                request,
+                Retrievable::class.java,
+                metadataFilter = null,
+                entityFilter = null,
+                entitiesOnly = true,
+            )
+
+            assertEquals(listOf("person"), results.map { it.match.id })
+        }
+
+        @Test
+        fun `filter dispatch extensions should default filters to null`() {
             val searchOperations = mockk<CoreSearchOperations>()
             val request = TextSimilaritySearchRequest("test query", 0.5, 5)
             every {
@@ -477,8 +502,8 @@ class ToolishRagTest {
                 searchOperations.textSearch(request, Chunk::class.java)
             } returns emptyList()
 
-            val vectorResults = searchOperations.vectorSearchWithFilter(request, Chunk::class.java, null, null)
-            val textResults = searchOperations.textSearchWithFilter(request, Chunk::class.java, null, null)
+            val vectorResults = searchOperations.vectorSearchWithFilterDispatch(request, Chunk::class.java)
+            val textResults = searchOperations.textSearchWithFilterDispatch(request, Chunk::class.java)
 
             assertTrue(vectorResults.isEmpty())
             assertTrue(textResults.isEmpty())
