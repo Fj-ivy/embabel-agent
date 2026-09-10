@@ -24,6 +24,7 @@ import java.util.UUID
 import kotlin.io.path.absolutePathString
 import kotlin.io.path.exists
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.seconds
 import kotlin.time.measureTimedValue
 
 /**
@@ -139,6 +140,8 @@ abstract class AbstractContainerSkillScriptExecutionEngine(
         val scriptDir = tempBase.resolve("script").also { Files.createDirectories(it) }
         val inputDir = tempBase.resolve("input").also { Files.createDirectories(it) }
         val outputDir = tempBase.resolve("output").also { Files.createDirectories(it) }
+        val launcherFailureFile = outputDir.resolve("$LAUNCHER_FAILURE_FILE-${UUID.randomUUID()}")
+        val containerIdFile = tempBase.resolve("container.cid")
         val containerInstanceName = "embabel-$tempDirPrefix-${UUID.randomUUID()}"
         var containerMayBeRunning = false
 
@@ -154,13 +157,29 @@ abstract class AbstractContainerSkillScriptExecutionEngine(
 
             val interpreter = interpreterFor(script.language)
             val command = interpreter + listOf("/script/${script.fileName}") + args
-            val containerCmd = buildContainerCommand(command, scriptDir, inputDir, outputDir, containerInstanceName)
+            val containerCmd = buildContainerCommand(
+                command,
+                scriptDir,
+                inputDir,
+                outputDir,
+                launcherFailureFile,
+                containerIdFile,
+                containerInstanceName,
+            )
 
             logger.debug("Executing {} command: {}", containerCommand, containerCmd.joinToString(" "))
 
             containerMayBeRunning = true
-            val result = runContainerProcess(containerCmd, stdin, outputDir, script.fileName)
-            containerMayBeRunning = result is ScriptExecutionResult.Failure && result.timedOut
+            val result = runContainerProcess(
+                containerCmd,
+                stdin,
+                outputDir,
+                launcherFailureFile,
+                containerIdFile,
+                script.fileName,
+            )
+            containerMayBeRunning = containerIdFile.exists() ||
+                (result is ScriptExecutionResult.Failure && result.timedOut)
             return result
         } finally {
             val safeToDeleteTempDirectory = !containerMayBeRunning || forceRemoveContainer(containerInstanceName)
@@ -183,12 +202,18 @@ abstract class AbstractContainerSkillScriptExecutionEngine(
         scriptDir: Path,
         inputDir: Path,
         outputDir: Path,
+        launcherFailureFile: Path,
+        containerIdFile: Path,
         containerInstanceName: String,
     ): List<String> {
         return buildList {
             // -i keeps the container's stdin open so a provided stdin is actually
             // delivered; without it the runtime attaches stdin to /dev/null and drops it.
-            add(containerCommand); add("run"); add("--rm"); add("--name"); add(containerInstanceName); add("-i")
+            // The CID file lets us inspect structured container state after execution. The
+            // container is removed explicitly in finally, after inspection has completed.
+            add(containerCommand); add("run")
+            add("--cidfile"); add(containerIdFile.absolutePathString())
+            add("--name"); add(containerInstanceName); add("-i")
 
             memoryLimit?.let { addAll(listOf("--memory", it.render())) }
             cpuLimit?.let { addAll(listOf("--cpus", it.render())) }
@@ -224,11 +249,14 @@ abstract class AbstractContainerSkillScriptExecutionEngine(
             if (!useWorkdir) {
                 // Shell wrapper: ensure workdir exists (Podman won't create it), cd into it,
                 // then exec the real command so signals / exit code pass through cleanly.
+                // A successful exec replaces the shell and discards its EXIT trap; launcher
+                // failures leave a private marker that cannot be confused with a script exit.
                 addAll(
                     listOf(
                         "/bin/sh",
                         "-c",
-                        "mkdir -p \"\$1\" && cd \"\$1\" && shift && exec \"\$@\"",
+                        "trap 'status=\$?; : > /output/${launcherFailureFile.fileName}; exit \"\$status\"' 0; " +
+                            "mkdir -p \"\$1\" && cd \"\$1\" && shift && exec \"\$@\"",
                         "--",
                         workDir,
                     )
@@ -275,6 +303,8 @@ abstract class AbstractContainerSkillScriptExecutionEngine(
         containerCommand: List<String>,
         stdin: String?,
         outputDir: Path,
+        launcherFailureFile: Path,
+        containerIdFile: Path,
         scriptFileName: String,
     ): ScriptExecutionResult {
         val process = ProcessBuilder(containerCommand)
@@ -295,20 +325,48 @@ abstract class AbstractContainerSkillScriptExecutionEngine(
 
         val exitCode = io.exitCode!!
 
-        if (isContainerStartupFailure(exitCode, io.stdout, io.stderr)) {
-            logger.error(
-                "{} failed to start script {}: exit={}, stderr={}",
-                containerName,
-                scriptFileName,
-                exitCode,
-                io.stderr.trim(),
-            )
-            return ScriptExecutionResult.Failure(
-                error = "$containerName failed to start the script",
-                stderr = io.stderr.takeIf { it.isNotBlank() },
-                exitCode = exitCode,
-                duration = duration,
-            )
+        val launcherFailed = launcherFailureFile.exists()
+        val startupStatus = if (launcherFailed) {
+            ContainerStartupStatus.FAILED
+        } else if (exitCode in 125..127 && io.stdout.isBlank()) {
+            determineContainerStartupStatus(exitCode, io.stdout, inspectContainerState(containerIdFile))
+        } else {
+            ContainerStartupStatus.STARTED
+        }
+
+        when (startupStatus) {
+            ContainerStartupStatus.FAILED -> {
+                logger.error(
+                    "{} failed to start script {}: exit={}, stderr={}",
+                    containerName,
+                    scriptFileName,
+                    exitCode,
+                    io.stderr.trim(),
+                )
+                return ScriptExecutionResult.Failure(
+                    error = "$containerName failed to start the script",
+                    stderr = io.stderr.takeIf { it.isNotBlank() },
+                    exitCode = exitCode,
+                    duration = duration,
+                )
+            }
+
+            ContainerStartupStatus.UNKNOWN -> {
+                logger.error(
+                    "Unable to inspect {} state after script {} exited with code {}",
+                    containerName,
+                    scriptFileName,
+                    exitCode,
+                )
+                return ScriptExecutionResult.Failure(
+                    error = "$containerName container state inspection failed",
+                    stderr = io.stderr.takeIf { it.isNotBlank() },
+                    exitCode = exitCode,
+                    duration = duration,
+                )
+            }
+
+            ContainerStartupStatus.STARTED -> Unit
         }
 
         val artifacts = inputs.stageArtifacts(outputDir)
@@ -327,31 +385,92 @@ abstract class AbstractContainerSkillScriptExecutionEngine(
         )
     }
 
+    internal sealed interface ContainerStateInspection {
+        data object NotCreated : ContainerStateInspection
+        data class Inspected(val startupFailed: Boolean) : ContainerStateInspection
+        data object Unavailable : ContainerStateInspection
+    }
+
+    internal enum class ContainerStartupStatus {
+        STARTED,
+        FAILED,
+        UNKNOWN,
+    }
+
     /**
      * Distinguish container-runtime startup errors from a script that deliberately exits
      * with one of the runtime-reserved exit codes (125, 126, or 127).
      *
-     * Podman prefixes its own errors with `Error:`, Docker prefixes them with `docker:`,
-     * and the Podman shell wrapper reports a missing interpreter as an `exec: ... not
-     * found` error. Requiring one of those diagnostics avoids treating an ordinary script
-     * exit with the same code as a container startup failure.
+     * This uses only the runtime's structured container state. When inspection is
+     * unavailable, it deliberately avoids inferring from human-readable stderr because
+     * that format is not a stable interface.
      */
-    internal fun isContainerStartupFailure(exitCode: Int, stdout: String, stderr: String): Boolean {
+    internal fun determineContainerStartupStatus(
+        exitCode: Int,
+        stdout: String,
+        inspection: ContainerStateInspection,
+    ): ContainerStartupStatus {
         if (exitCode !in 125..127 || stdout.isNotBlank()) {
-            return false
+            return ContainerStartupStatus.STARTED
         }
 
-        val runtimePrefix = "${containerCommand.substringAfterLast('/')}:"
-        return stderr.lineSequence()
-            .map(String::trim)
-            .any { line ->
-                line.startsWith("Error:") ||
-                    line.startsWith(runtimePrefix, ignoreCase = true) ||
-                    (exitCode == 127 &&
-                        line.contains("exec:") &&
-                        (line.endsWith("not found", ignoreCase = true) ||
-                            line.endsWith("no such file or directory", ignoreCase = true)))
+        return when (inspection) {
+            ContainerStateInspection.NotCreated -> ContainerStartupStatus.FAILED
+            is ContainerStateInspection.Inspected -> if (inspection.startupFailed) {
+                ContainerStartupStatus.FAILED
+            } else {
+                ContainerStartupStatus.STARTED
             }
+
+            ContainerStateInspection.Unavailable -> ContainerStartupStatus.UNKNOWN
+        }
+    }
+
+    private fun inspectContainerState(containerIdFile: Path): ContainerStateInspection {
+        val containerId = try {
+            if (!containerIdFile.exists()) return ContainerStateInspection.NotCreated
+            Files.readString(containerIdFile).trim().takeIf(String::isNotEmpty)
+                ?: return ContainerStateInspection.NotCreated
+        } catch (e: Exception) {
+            logger.warn("Failed to read {} CID file {}: {}", containerName, containerIdFile, e.message)
+            return ContainerStateInspection.Unavailable
+        }
+
+        val process = try {
+            ProcessBuilder(
+                containerCommand,
+                "container",
+                "inspect",
+                "--format",
+                "{{.State.Error}}",
+                containerId,
+            ).redirectErrorStream(false).start()
+        } catch (e: Exception) {
+            logger.warn("Failed to start {} container inspection: {}", containerName, e.message)
+            return ContainerStateInspection.Unavailable
+        }
+
+        return try {
+            val io = process.pumpIo(null, 5.seconds)
+            if (io.timedOut || io.exitCode != 0) {
+                logger.warn(
+                    "Failed to inspect {} container {}: exit={}, timedOut={}, stderr={}",
+                    containerName,
+                    containerId,
+                    io.exitCode,
+                    io.timedOut,
+                    io.stderr.trim(),
+                )
+                ContainerStateInspection.Unavailable
+            } else {
+                ContainerStateInspection.Inspected(io.stdout.isNotBlank())
+            }
+        } catch (e: InterruptedException) {
+            process.destroyForcibly()
+            Thread.currentThread().interrupt()
+            logger.warn("Interrupted while inspecting {} container {}", containerName, containerId)
+            ContainerStateInspection.Unavailable
+        }
     }
 
     // --- Interpreter selection ---
@@ -393,6 +512,8 @@ abstract class AbstractContainerSkillScriptExecutionEngine(
          * ```
          */
         const val DEFAULT_IMAGE = "embabel/agent-sandbox:latest"
+
+        private const val LAUNCHER_FAILURE_FILE = ".embabel-launcher-failed"
 
         private val logger = LoggerFactory.getLogger(AbstractContainerSkillScriptExecutionEngine::class.java)
 

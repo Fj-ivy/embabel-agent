@@ -43,11 +43,19 @@ class AbstractContainerSkillScriptExecutionEngineTest {
                 scriptDir = root.resolve("script"),
                 inputDir = root.resolve("input"),
                 outputDir = root.resolve("output"),
+                launcherFailureFile = root.resolve("output/.embabel-launcher-failed-test"),
+                containerIdFile = root.resolve("container.cid"),
                 containerInstanceName = "test-container",
             )
 
             assertEquals("test-container", command[command.indexOf("--name") + 1])
-            assertEquals("mkdir -p \"\$1\" && cd \"\$1\" && shift && exec \"\$@\"", command[command.indexOf("-c") + 1])
+            assertEquals(root.resolve("container.cid").toString(), command[command.indexOf("--cidfile") + 1])
+            assertFalse(command.contains("--rm"))
+            assertEquals(
+                "trap 'status=\$?; : > /output/.embabel-launcher-failed-test; exit \"\$status\"' 0; " +
+                    "mkdir -p \"\$1\" && cd \"\$1\" && shift && exec \"\$@\"",
+                command[command.indexOf("-c") + 1],
+            )
             assertTrue(command.contains(workDir))
             assertFalse(command[command.indexOf("-c") + 1].contains(workDir))
         } finally {
@@ -56,32 +64,16 @@ class AbstractContainerSkillScriptExecutionEngineTest {
     }
 
     @Test
-    fun `podman runtime error is a container startup failure`() {
+    fun `container not created is a startup failure`() {
         val engine = TestContainerEngine(System.getProperty("java.io.tmpdir"), "/work")
 
-        assertTrue(
-            engine.isContainerStartupFailure(
+        assertEquals(
+            AbstractContainerSkillScriptExecutionEngine.ContainerStartupStatus.FAILED,
+            engine.determineContainerStartupStatus(
                 exitCode = 125,
                 stdout = "",
-                stderr = "Error: preparing container for attach: OCI runtime error",
-            )
-        )
-    }
-
-    @Test
-    fun `docker runtime error is a container startup failure`() {
-        val engine = TestContainerEngine(
-            root = System.getProperty("java.io.tmpdir"),
-            workDir = "/work",
-            containerCommand = "docker",
-        )
-
-        assertTrue(
-            engine.isContainerStartupFailure(
-                exitCode = 126,
-                stdout = "",
-                stderr = "docker: Error response from daemon: failed to create task",
-            )
+                inspection = AbstractContainerSkillScriptExecutionEngine.ContainerStateInspection.NotCreated,
+            ),
         )
     }
 
@@ -91,18 +83,11 @@ class AbstractContainerSkillScriptExecutionEngineTest {
         val root = Files.createTempDirectory("container-startup-failure-test-")
         val runtime = root.resolve("fake-podman")
         val scripts = root.resolve("scripts").also { Files.createDirectories(it) }
-        Files.writeString(
-            runtime,
-            """
-                |#!/bin/sh
-                |if [ "${'$'}1" = "version" ]; then
-                |  exit 0
-                |fi
-                |echo "Error: preparing container for attach: OCI runtime error" >&2
-                |exit 125
-            """.trimMargin(),
+        writeFakeRuntime(
+            runtime = runtime,
+            exitCode = 125,
+            stderr = "runtime failed before creating the container",
         )
-        assertTrue(runtime.toFile().setExecutable(true))
         Files.writeString(scripts.resolve("test.sh"), "echo should-not-run")
 
         try {
@@ -115,7 +100,7 @@ class AbstractContainerSkillScriptExecutionEngineTest {
             val failure = result as ScriptExecutionResult.Failure
             assertEquals(125, failure.exitCode)
             assertEquals("Podman failed to start the script", failure.error)
-            assertTrue(failure.stderr!!.contains("OCI runtime error"))
+            assertTrue(failure.stderr!!.contains("runtime failed"))
             assertFalse(failure.timedOut)
         } finally {
             root.toFile().deleteRecursively()
@@ -123,15 +108,113 @@ class AbstractContainerSkillScriptExecutionEngineTest {
     }
 
     @Test
-    fun `missing interpreter is a container startup failure`() {
+    @EnabledOnOs(OS.LINUX, OS.MAC)
+    fun `structured startup error returns Failure and removes container`() {
+        val root = Files.createTempDirectory("container-state-error-test-")
+        val runtime = root.resolve("fake-podman")
+        val removedMarker = runtime.resolveSibling("${runtime.fileName}.removed")
+        val scripts = root.resolve("scripts").also { Files.createDirectories(it) }
+        writeFakeRuntime(
+            runtime = runtime,
+            exitCode = 127,
+            stderr = "an unfamiliar runtime diagnostic",
+            stateError = "executable file not found",
+        )
+        Files.writeString(scripts.resolve("test.sh"), "echo should-not-run")
+
+        try {
+            val engine = TestContainerEngine(root.toString(), "/work", runtime.toString())
+            val script = SkillScript("test", "test.sh", ScriptLanguage.BASH, root)
+
+            val result = engine.execute(script)
+
+            assertTrue(result is ScriptExecutionResult.Failure, "Expected Failure but got: $result")
+            val failure = result as ScriptExecutionResult.Failure
+            assertEquals(127, failure.exitCode)
+            assertEquals("Podman failed to start the script", failure.error)
+            assertTrue(failure.stderr!!.contains("unfamiliar runtime diagnostic"))
+            assertTrue(Files.exists(removedMarker), "Expected the stopped container to be removed")
+        } finally {
+            root.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
+    @EnabledOnOs(OS.LINUX, OS.MAC)
+    fun `empty structured startup error preserves reserved script exits and removes containers`() {
+        for (exitCode in 125..127) {
+            val root = Files.createTempDirectory("container-state-empty-test-")
+            val runtime = root.resolve("fake-podman")
+            val removedMarker = runtime.resolveSibling("${runtime.fileName}.removed")
+            val scripts = root.resolve("scripts").also { Files.createDirectories(it) }
+            writeFakeRuntime(
+                runtime = runtime,
+                exitCode = exitCode,
+                stderr = "Error: script chose exit $exitCode",
+                stateError = "",
+            )
+            Files.writeString(scripts.resolve("test.sh"), "exit $exitCode")
+
+            try {
+                val engine = TestContainerEngine(root.toString(), "/work", runtime.toString())
+                val script = SkillScript("test", "test.sh", ScriptLanguage.BASH, root)
+
+                val result = engine.execute(script)
+
+                assertTrue(result is ScriptExecutionResult.Success, "Expected Success but got: $result")
+                val success = result as ScriptExecutionResult.Success
+                assertEquals(exitCode, success.exitCode)
+                assertTrue(success.stderr.contains("Error: script chose exit $exitCode"))
+                assertTrue(Files.exists(removedMarker), "Expected the stopped container to be removed")
+            } finally {
+                root.toFile().deleteRecursively()
+            }
+        }
+    }
+
+    @Test
+    @EnabledOnOs(OS.LINUX, OS.MAC)
+    fun `unavailable container inspection returns Failure and removes container`() {
+        val root = Files.createTempDirectory("container-state-unavailable-test-")
+        val runtime = root.resolve("fake-podman")
+        val removedMarker = runtime.resolveSibling("${runtime.fileName}.removed")
+        val scripts = root.resolve("scripts").also { Files.createDirectories(it) }
+        writeFakeRuntime(
+            runtime = runtime,
+            exitCode = 125,
+            stderr = "runtime state unavailable",
+            stateError = "",
+            inspectionExitCode = 1,
+        )
+        Files.writeString(scripts.resolve("test.sh"), "exit 125")
+
+        try {
+            val engine = TestContainerEngine(root.toString(), "/work", runtime.toString())
+            val script = SkillScript("test", "test.sh", ScriptLanguage.BASH, root)
+
+            val result = engine.execute(script)
+
+            assertTrue(result is ScriptExecutionResult.Failure, "Expected Failure but got: $result")
+            val failure = result as ScriptExecutionResult.Failure
+            assertEquals(125, failure.exitCode)
+            assertEquals("Podman container state inspection failed", failure.error)
+            assertTrue(Files.exists(removedMarker), "Expected the stopped container to be removed")
+        } finally {
+            root.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `structured state error is a container startup failure`() {
         val engine = TestContainerEngine(System.getProperty("java.io.tmpdir"), "/work")
 
-        assertTrue(
-            engine.isContainerStartupFailure(
+        assertEquals(
+            AbstractContainerSkillScriptExecutionEngine.ContainerStartupStatus.FAILED,
+            engine.determineContainerStartupStatus(
                 exitCode = 127,
                 stdout = "",
-                stderr = "--: 1: exec: python3: not found",
-            )
+                inspection = AbstractContainerSkillScriptExecutionEngine.ContainerStateInspection.Inspected(true),
+            ),
         )
     }
 
@@ -140,15 +223,30 @@ class AbstractContainerSkillScriptExecutionEngineTest {
         val engine = TestContainerEngine(System.getProperty("java.io.tmpdir"), "/work")
 
         for (exitCode in 125..127) {
-            assertFalse(
-                engine.isContainerStartupFailure(
+            assertEquals(
+                AbstractContainerSkillScriptExecutionEngine.ContainerStartupStatus.STARTED,
+                engine.determineContainerStartupStatus(
                     exitCode = exitCode,
                     stdout = "",
-                    stderr = "script reported an expected error",
+                    inspection = AbstractContainerSkillScriptExecutionEngine.ContainerStateInspection.Inspected(false),
                 ),
                 "Exit code $exitCode without a runtime diagnostic must remain a script result",
             )
         }
+    }
+
+    @Test
+    fun `unavailable inspection produces unknown startup status`() {
+        val engine = TestContainerEngine(System.getProperty("java.io.tmpdir"), "/work")
+
+        assertEquals(
+            AbstractContainerSkillScriptExecutionEngine.ContainerStartupStatus.UNKNOWN,
+            engine.determineContainerStartupStatus(
+                exitCode = 125,
+                stdout = "",
+                inspection = AbstractContainerSkillScriptExecutionEngine.ContainerStateInspection.Unavailable,
+            ),
+        )
     }
 
     @Test
@@ -178,6 +276,50 @@ class AbstractContainerSkillScriptExecutionEngineTest {
         } finally {
             Thread.interrupted()
         }
+    }
+
+    private fun writeFakeRuntime(
+        runtime: java.nio.file.Path,
+        exitCode: Int,
+        stderr: String,
+        stateError: String? = null,
+        inspectionExitCode: Int = 0,
+    ) {
+        Files.writeString(
+            runtime,
+            """
+                |#!/bin/sh
+                |case "${'$'}1" in
+                |  version)
+                |    exit 0
+                |    ;;
+                |  run)
+                |    shift
+                |    while [ "${'$'}#" -gt 0 ]; do
+                |      if [ "${'$'}1" = "--cidfile" ]; then
+                |        ${if (stateError == null) ":" else "printf '%s\\n' fake-container-id > \"${'$'}2\""}
+                |        break
+                |      fi
+                |      shift
+                |    done
+                |    printf '%s\n' '$stderr' >&2
+                |    exit $exitCode
+                |    ;;
+                |  container)
+                |    if [ "${'$'}2" = "inspect" ]; then
+                |      printf '%s\n' '${stateError.orEmpty()}'
+                |      exit $inspectionExitCode
+                |    fi
+                |    ;;
+                |  rm)
+                |    touch "${'$'}0.removed"
+                |    exit 0
+                |    ;;
+                |esac
+                |exit 2
+            """.trimMargin(),
+        )
+        assertTrue(runtime.toFile().setExecutable(true))
     }
 
     private class TestContainerEngine(

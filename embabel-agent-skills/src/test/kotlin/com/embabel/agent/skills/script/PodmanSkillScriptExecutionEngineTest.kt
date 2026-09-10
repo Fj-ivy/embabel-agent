@@ -166,6 +166,38 @@ class PodmanSkillScriptExecutionEngineTest {
 
     @Test
     @EnabledIf("isPodmanAvailable")
+    fun `execute preserves script exit code 127`() {
+        val engine = PodmanSkillScriptExecutionEngine(
+            image = TEST_IMAGE,
+            user = null,
+        )
+        val script = createScript("test.sh", ScriptLanguage.BASH, "#!/bin/bash\nexit 127")
+
+        val result = engine.execute(script)
+
+        assertTrue(result is ScriptExecutionResult.Success)
+        assertEquals(127, (result as ScriptExecutionResult.Success).exitCode)
+    }
+
+    @Test
+    @EnabledIf("isPodmanAvailable")
+    fun `execute returns Failure when interpreter is missing`() {
+        val engine = PodmanSkillScriptExecutionEngine(
+            image = TEST_IMAGE,
+            user = null,
+        )
+        val script = createScript("test.kts", ScriptLanguage.KOTLIN_SCRIPT, "println(\"should not run\")")
+
+        val result = engine.execute(script)
+
+        assertTrue(result is ScriptExecutionResult.Failure, "Expected Failure but got: $result")
+        val failure = result as ScriptExecutionResult.Failure
+        assertEquals(127, failure.exitCode)
+        assertEquals("Podman failed to start the script", failure.error)
+    }
+
+    @Test
+    @EnabledIf("isPodmanAvailable")
     fun `execute passes arguments to script`() {
         val engine = PodmanSkillScriptExecutionEngine(
             image = TEST_IMAGE,
