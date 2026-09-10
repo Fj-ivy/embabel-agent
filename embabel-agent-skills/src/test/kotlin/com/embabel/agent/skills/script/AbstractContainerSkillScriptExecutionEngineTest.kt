@@ -16,11 +16,17 @@
 package com.embabel.agent.skills.script
 
 import com.embabel.agent.tools.file.FileTools
+import io.mockk.every
+import io.mockk.mockk
+import io.mockk.verify
 import org.junit.jupiter.api.Assertions.assertEquals
 import org.junit.jupiter.api.Assertions.assertFalse
 import org.junit.jupiter.api.Assertions.assertTrue
 import org.junit.jupiter.api.Test
+import org.junit.jupiter.api.condition.EnabledOnOs
+import org.junit.jupiter.api.condition.OS
 import java.nio.file.Files
+import java.util.concurrent.TimeUnit
 import kotlin.time.Duration.Companion.seconds
 
 class AbstractContainerSkillScriptExecutionEngineTest {
@@ -49,7 +55,136 @@ class AbstractContainerSkillScriptExecutionEngineTest {
         }
     }
 
-    private class TestContainerEngine(root: String, workDir: String) : AbstractContainerSkillScriptExecutionEngine(
+    @Test
+    fun `podman runtime error is a container startup failure`() {
+        val engine = TestContainerEngine(System.getProperty("java.io.tmpdir"), "/work")
+
+        assertTrue(
+            engine.isContainerStartupFailure(
+                exitCode = 125,
+                stdout = "",
+                stderr = "Error: preparing container for attach: OCI runtime error",
+            )
+        )
+    }
+
+    @Test
+    fun `docker runtime error is a container startup failure`() {
+        val engine = TestContainerEngine(
+            root = System.getProperty("java.io.tmpdir"),
+            workDir = "/work",
+            containerCommand = "docker",
+        )
+
+        assertTrue(
+            engine.isContainerStartupFailure(
+                exitCode = 126,
+                stdout = "",
+                stderr = "docker: Error response from daemon: failed to create task",
+            )
+        )
+    }
+
+    @Test
+    @EnabledOnOs(OS.LINUX, OS.MAC)
+    fun `container runtime startup error returns Failure`() {
+        val root = Files.createTempDirectory("container-startup-failure-test-")
+        val runtime = root.resolve("fake-podman")
+        val scripts = root.resolve("scripts").also { Files.createDirectories(it) }
+        Files.writeString(
+            runtime,
+            """
+                |#!/bin/sh
+                |if [ "${'$'}1" = "version" ]; then
+                |  exit 0
+                |fi
+                |echo "Error: preparing container for attach: OCI runtime error" >&2
+                |exit 125
+            """.trimMargin(),
+        )
+        assertTrue(runtime.toFile().setExecutable(true))
+        Files.writeString(scripts.resolve("test.sh"), "echo should-not-run")
+
+        try {
+            val engine = TestContainerEngine(root.toString(), "/work", runtime.toString())
+            val script = SkillScript("test", "test.sh", ScriptLanguage.BASH, root)
+
+            val result = engine.execute(script)
+
+            assertTrue(result is ScriptExecutionResult.Failure, "Expected Failure but got: $result")
+            val failure = result as ScriptExecutionResult.Failure
+            assertEquals(125, failure.exitCode)
+            assertEquals("Podman failed to start the script", failure.error)
+            assertTrue(failure.stderr!!.contains("OCI runtime error"))
+            assertFalse(failure.timedOut)
+        } finally {
+            root.toFile().deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `missing interpreter is a container startup failure`() {
+        val engine = TestContainerEngine(System.getProperty("java.io.tmpdir"), "/work")
+
+        assertTrue(
+            engine.isContainerStartupFailure(
+                exitCode = 127,
+                stdout = "",
+                stderr = "--: 1: exec: python3: not found",
+            )
+        )
+    }
+
+    @Test
+    fun `script non-zero exits remain successful executions`() {
+        val engine = TestContainerEngine(System.getProperty("java.io.tmpdir"), "/work")
+
+        for (exitCode in 125..127) {
+            assertFalse(
+                engine.isContainerStartupFailure(
+                    exitCode = exitCode,
+                    stdout = "",
+                    stderr = "script reported an expected error",
+                ),
+                "Exit code $exitCode without a runtime diagnostic must remain a script result",
+            )
+        }
+    }
+
+    @Test
+    fun `runtime check timeout destroys process and returns false`() {
+        val process = mockk<Process>()
+        every { process.waitFor(5, TimeUnit.SECONDS) } returns false
+        every { process.destroyForcibly() } returns process
+
+        val result = AbstractContainerSkillScriptExecutionEngine.processCompletesSuccessfully(process)
+
+        assertFalse(result)
+        verify(exactly = 1) { process.destroyForcibly() }
+    }
+
+    @Test
+    fun `interrupted runtime check destroys process and restores interrupt`() {
+        val process = mockk<Process>()
+        every { process.waitFor(5, TimeUnit.SECONDS) } throws InterruptedException("test interruption")
+        every { process.destroyForcibly() } returns process
+
+        try {
+            val result = AbstractContainerSkillScriptExecutionEngine.processCompletesSuccessfully(process)
+
+            assertFalse(result)
+            assertTrue(Thread.currentThread().isInterrupted)
+            verify(exactly = 1) { process.destroyForcibly() }
+        } finally {
+            Thread.interrupted()
+        }
+    }
+
+    private class TestContainerEngine(
+        root: String,
+        workDir: String,
+        override val containerCommand: String = "podman",
+    ) : AbstractContainerSkillScriptExecutionEngine(
         image = "test-image",
         timeout = 1.seconds,
         supportedLanguages = ScriptLanguage.entries.toSet(),
@@ -61,7 +196,6 @@ class AbstractContainerSkillScriptExecutionEngineTest {
         user = null,
         fileTools = FileTools.readWrite(root),
     ) {
-        override val containerCommand = "podman"
         override val containerName = "Podman"
         override val tempDirPrefix = "test-container-"
         override val daemonErrorMessage = "unavailable"

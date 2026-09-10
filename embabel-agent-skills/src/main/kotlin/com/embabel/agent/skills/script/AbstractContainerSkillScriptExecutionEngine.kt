@@ -294,6 +294,23 @@ abstract class AbstractContainerSkillScriptExecutionEngine(
         }
 
         val exitCode = io.exitCode!!
+
+        if (isContainerStartupFailure(exitCode, io.stdout, io.stderr)) {
+            logger.error(
+                "{} failed to start script {}: exit={}, stderr={}",
+                containerName,
+                scriptFileName,
+                exitCode,
+                io.stderr.trim(),
+            )
+            return ScriptExecutionResult.Failure(
+                error = "$containerName failed to start the script",
+                stderr = io.stderr.takeIf { it.isNotBlank() },
+                exitCode = exitCode,
+                duration = duration,
+            )
+        }
+
         val artifacts = inputs.stageArtifacts(outputDir)
 
         logger.debug(
@@ -308,6 +325,33 @@ abstract class AbstractContainerSkillScriptExecutionEngine(
             duration = duration,
             artifacts = artifacts,
         )
+    }
+
+    /**
+     * Distinguish container-runtime startup errors from a script that deliberately exits
+     * with one of the runtime-reserved exit codes (125, 126, or 127).
+     *
+     * Podman prefixes its own errors with `Error:`, Docker prefixes them with `docker:`,
+     * and the Podman shell wrapper reports a missing interpreter as an `exec: ... not
+     * found` error. Requiring one of those diagnostics avoids treating an ordinary script
+     * exit with the same code as a container startup failure.
+     */
+    internal fun isContainerStartupFailure(exitCode: Int, stdout: String, stderr: String): Boolean {
+        if (exitCode !in 125..127 || stdout.isNotBlank()) {
+            return false
+        }
+
+        val runtimePrefix = "${containerCommand.substringAfterLast('/')}:"
+        return stderr.lineSequence()
+            .map(String::trim)
+            .any { line ->
+                line.startsWith("Error:") ||
+                    line.startsWith(runtimePrefix, ignoreCase = true) ||
+                    (exitCode == 127 &&
+                        line.contains("exec:") &&
+                        (line.endsWith("not found", ignoreCase = true) ||
+                            line.endsWith("no such file or directory", ignoreCase = true)))
+            }
     }
 
     // --- Interpreter selection ---
@@ -357,9 +401,25 @@ abstract class AbstractContainerSkillScriptExecutionEngine(
             val process = ProcessBuilder(listOf(containerCommand, *args))
                 .redirectErrorStream(true)
                 .start()
-            process.waitFor(5, TimeUnit.SECONDS) && process.exitValue() == 0
+            processCompletesSuccessfully(process)
         } catch (e: Exception) {
             logger.warn("containerCommand: $containerCommand failed. error: ${e.message}")
+            false
+        }
+
+        internal fun processCompletesSuccessfully(process: Process): Boolean = try {
+            if (!process.waitFor(5, TimeUnit.SECONDS)) {
+                process.destroyForcibly()
+                false
+            } else {
+                process.exitValue() == 0
+            }
+        } catch (e: InterruptedException) {
+            try {
+                process.destroyForcibly()
+            } finally {
+                Thread.currentThread().interrupt()
+            }
             false
         }
 
